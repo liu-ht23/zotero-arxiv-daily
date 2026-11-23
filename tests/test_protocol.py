@@ -138,7 +138,7 @@ def test_affiliations_malformed_llm_output(llm_params):
     )
     paper = make_sample_paper()
     result = paper.generate_affiliations(client, llm_params)
-    # re.search for [...] will fail -> AttributeError -> caught -> returns None
+    # No brackets even after the one retry (stub always returns the same prose) -> None.
     assert result is None
 
 
@@ -154,3 +154,58 @@ def test_affiliations_error_returns_none(llm_params):
     result = paper.generate_affiliations(broken_client, llm_params)
     assert result is None
     assert paper.affiliations is None
+
+
+# ---------------------------------------------------------------------------
+# _parse_affiliation_list (the tolerant parser) + single-quote regression
+# ---------------------------------------------------------------------------
+
+
+def test_parse_affiliation_list_handles_single_quotes():
+    """Real-world failure 2026-11-23: local Qwen returns a Python single-quoted list,
+    which json.loads rejects with 'Expecting value: line 1 column 2'. ast.literal_eval saves it."""
+    from zotero_arxiv_daily.protocol import _parse_affiliation_list
+
+    assert _parse_affiliation_list("['Tsinghua University', 'Peking University']") == [
+        "Tsinghua University",
+        "Peking University",
+    ]
+    # double-quoted JSON still works; dedup preserves order; [] is a valid (empty) parse
+    assert _parse_affiliation_list('["A","B","A"]') == ["A", "B"]
+    assert _parse_affiliation_list("Here you go: ['MIT']\nHope it helps") == ["MIT"]
+    assert _parse_affiliation_list("[]") == []
+    # negative controls: no list at all -> None (caller then retries / gives up, never crashes)
+    assert _parse_affiliation_list("Tsinghua University, Peking University") is None
+    assert _parse_affiliation_list("") is None
+    assert _parse_affiliation_list(None) is None
+
+
+def test_affiliations_single_quoted_end_to_end(llm_params):
+    """A stub emitting a single-quoted list must parse on the first try (no retry needed)."""
+    from types import SimpleNamespace
+
+    def create(**kwargs):
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="['Stanford University', 'MIT']"))]
+        )
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    result = make_sample_paper().generate_affiliations(client, llm_params)
+    assert result == ["Stanford University", "MIT"]
+
+
+def test_affiliations_retry_recovers(llm_params):
+    """First reply is unparseable prose; the one retry returns valid JSON and we recover it."""
+    from types import SimpleNamespace
+
+    calls = {"n": 0}
+
+    def create(**kwargs):
+        calls["n"] += 1
+        content = "Sure, the affiliations are Tsinghua and Peking." if calls["n"] == 1 else '["Tsinghua University"]'
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    result = make_sample_paper().generate_affiliations(client, llm_params)
+    assert result == ["Tsinghua University"]
+    assert calls["n"] == 2  # exactly one retry

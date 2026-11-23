@@ -1,12 +1,45 @@
 from dataclasses import dataclass
 from typing import Optional, TypeVar
 from datetime import datetime
+import ast
 import re
 import tiktoken
 from openai import OpenAI
 from loguru import logger
 import json
 RawPaperItem = TypeVar('RawPaperItem')
+
+
+def _parse_affiliation_list(text: Optional[str]) -> Optional[list[str]]:
+    """Extract a list of affiliation strings from an LLM reply, or None if unparseable.
+
+    Tolerant of what small local models emit: a JSON array (double quotes) OR a
+    Python-style single-quoted list (json.loads -> "Expecting value: line 1 column 2";
+    ast.literal_eval handles it). Returns a de-duplicated, order-preserving list of
+    non-empty strings; [] is a valid parse (model found no affiliation).
+    """
+    if not text:
+        return None
+    m = re.search(r'\[.*\]', text, flags=re.DOTALL)  # greedy: outermost brackets
+    if m is None:
+        return None
+    raw = m.group(0)
+    value = None
+    for loader in (json.loads, ast.literal_eval):
+        try:
+            value = loader(raw)
+            break
+        except (ValueError, SyntaxError):
+            continue
+    if not isinstance(value, list):
+        return None
+    out, seen = [], set()
+    for a in value:
+        s = str(a).strip()
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
 
 
 def _request_llm(openai_client: OpenAI, llm_params: dict, messages: list[dict]) -> str:
@@ -115,12 +148,26 @@ class Paper:
                 ],
             )
 
-            affiliations = re.search(r'\[.*?\]', affiliations, flags=re.DOTALL).group(0)
-            affiliations = json.loads(affiliations)
-            affiliations = list(set(affiliations))
-            affiliations = [str(a) for a in affiliations]
-
-            return affiliations
+            parsed = _parse_affiliation_list(affiliations)
+            if parsed is None:
+                # Small local models (e.g. Qwen) often emit a Python-style single-quoted
+                # list, prose, or trailing text; ask once more for a strict JSON array.
+                affiliations = _request_llm(
+                    openai_client,
+                    llm_params,
+                    [
+                        {"role": "system", "content": "You extract author affiliations."},
+                        {"role": "user", "content": prompt},
+                        {"role": "assistant", "content": affiliations},
+                        {"role": "user", "content": 'Return ONLY a JSON array of double-quoted '
+                         'strings, e.g. ["Tsinghua University","Peking University"]. '
+                         'If none, return []. No other text.'},
+                    ],
+                )
+                parsed = _parse_affiliation_list(affiliations)
+            if parsed is None:
+                raise ValueError(f"could not parse an affiliation list from: {affiliations[:120]!r}")
+            return parsed
     
     def generate_affiliations(self, openai_client:OpenAI,llm_params:dict) -> Optional[list[str]]:
         try:
