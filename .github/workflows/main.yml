@@ -17,6 +17,33 @@ jobs:
       - name: Setup uv
         uses: astral-sh/setup-uv@v7
 
+      # Local LLM on the runner (2026-11-23): llama.cpp CPU build + Qwen3.5-4B Q4_K_M, OpenAI-compatible
+      # server on 127.0.0.1:8080; no external LLM API or key needed. Pinned versions, model cached across runs.
+      - name: Cache local model
+        uses: actions/cache@v4
+        with:
+          path: ~/models
+          key: qwen3.5-4b-q4km-v1
+      - name: Start local llama-server
+        env:
+          LLAMA_TAG: b12649
+          MODEL_URL: https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf
+        run: |
+          set -euo pipefail
+          mkdir -p ~/models ~/llama
+          [ -s ~/models/qwen3.5-4b-q4km.gguf ] || curl -fL --retry 3 -o ~/models/qwen3.5-4b-q4km.gguf "$MODEL_URL"
+          curl -fL --retry 3 -o /tmp/llama.tgz "https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_TAG}/llama-${LLAMA_TAG}-bin-ubuntu-x64.tar.gz"
+          tar -xzf /tmp/llama.tgz -C ~/llama
+          SERVER=$(find ~/llama -name llama-server -type f | head -1)
+          export LD_LIBRARY_PATH="$(dirname "$SERVER"):${LD_LIBRARY_PATH:-}"
+          nohup "$SERVER" -m ~/models/qwen3.5-4b-q4km.gguf --host 127.0.0.1 --port 8080             -c 8192 -t "$(nproc)" --jinja --reasoning-budget 0             --chat-template-kwargs '{"enable_thinking":false}' > /tmp/llama-server.log 2>&1 &
+          for i in $(seq 120); do curl -sf http://127.0.0.1:8080/health >/dev/null && break; sleep 2; done
+          curl -sf http://127.0.0.1:8080/health || { tail -50 /tmp/llama-server.log; exit 1; }
+          # smoke test: one completion, must be non-empty and contain no <think>
+          OUT=$(curl -sf http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json'             -d '{"model":"local","max_tokens":64,"messages":[{"role":"user","content":"Say hello in one short sentence."}]}'             | python3 -c 'import json,sys; m=json.load(sys.stdin)["choices"][0]["message"]; print(repr(m.get("content")), "reasoning_len", len(m.get("reasoning_content") or ""))')
+          echo "smoke: $OUT"
+          echo "$OUT" | grep -q "<think>" && { echo "thinking not disabled"; exit 1; } || true
+
       - name: Run script
         env:
           ZOTERO_ID: ${{ secrets.ZOTERO_ID }}
@@ -24,11 +51,19 @@ jobs:
           SENDER: ${{ secrets.SENDER }}
           RECEIVER: ${{ secrets.RECEIVER }}
           SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_API_BASE: ${{ secrets.OPENAI_API_BASE }}
+          # Pre-refactor secrets, reused by CUSTOM_CONFIG via ${oc.env:...} (2026-11-23)
+          SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          ARXIV_QUERY: ${{ secrets.ARXIV_QUERY }}
+          OPENAI_API_KEY: local-no-key
+          OPENAI_API_BASE: http://127.0.0.1:8080/v1
           CUSTOM_CONFIG: ${{ vars.CUSTOM_CONFIG }}
         run: |
           printf "%b\n" "$CUSTOM_CONFIG" > config/custom.yaml
           echo "Use custom config: "
           cat config/custom.yaml
           uv run src/zotero_arxiv_daily/main.py
+
+      - name: llama-server log (tail)
+        if: always()
+        run: tail -40 /tmp/llama-server.log || true
