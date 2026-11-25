@@ -1,10 +1,21 @@
 name: Keep Alive
 
+# Why (2026-11-25): GitHub disables a repo's scheduled workflows after 60 days with no
+# repository activity. "Activity" = a push/release/PR; a cron run does NOT count, and a
+# commit made with the default GITHUB_TOKEN (github-actions[bot]) is NOT guaranteed to count.
+# The previous keep-alive committed as the bot, so it never reset the timer and every
+# scheduled workflow (this one included) was disabled in early October.
+#
+# Fix: run WEEKLY (far under 60 days) and push a REAL commit authenticated with a PAT
+# (secret KEEPALIVE_PAT) so the author is a real user and the push definitely counts.
+# Falls back to GITHUB_TOKEN if the PAT is not set yet (works immediately, but set the PAT
+# to be certain). Create the PAT: fine-grained, repo liu-ht23/zotero-arxiv-daily only,
+# Contents: Read and write.
+
 on:
   workflow_dispatch:
   schedule:
-    # Run every 30 days at 00:00 UTC to keep the repository active
-    - cron: '0 0 */30 * *'
+    - cron: '0 3 * * 1'   # every Monday 03:00 UTC
 
 jobs:
   keep-alive:
@@ -15,22 +26,26 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
         with:
-          fetch-depth: 0
+          token: ${{ secrets.KEEPALIVE_PAT || github.token }}
 
-      - name: Update keep-alive file
+      - name: Push a real commit so the 60-day timer resets
         run: |
+          set -euo pipefail
+          if [ -n "${{ secrets.KEEPALIVE_PAT }}" ]; then
+            git config user.name  "liu-ht23"
+            git config user.email "liu-ht23@mails.tsinghua.edu.cn"
+          else
+            echo "::warning::KEEPALIVE_PAT not set; committing as github-actions[bot], which may NOT count as repo activity. Set the PAT to be safe."
+            git config user.name  "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+          fi
           mkdir -p .github
-          echo "Last run: $(date -u +'%Y-%m-%d %H:%M:%S UTC')" > .github/keep-alive.txt
-          echo "This file is automatically updated to keep the repository active and prevent GitHub Actions from disabling scheduled workflows." >> .github/keep-alive.txt
-
-      - name: Commit and push if changed
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          printf 'Last keep-alive: %s\nKeeps scheduled workflows from being disabled after 60 days of inactivity.\n' \
+            "$(date -u +'%Y-%m-%d %H:%M:%S UTC')" > .github/keep-alive.txt
           git add .github/keep-alive.txt
           if git diff --staged --quiet; then
-            echo "No changes to commit"
+            echo "no change"
           else
-            git commit -m "chore: update keep-alive timestamp [skip ci]"
+            git commit -m "chore: keep-alive touch [skip ci]"
             git push
           fi
